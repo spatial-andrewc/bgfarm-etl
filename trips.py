@@ -1,131 +1,132 @@
 import json
+from shapely.geometry import LineString, Point
+from shapely.ops import transform
 import geojson
-from geojson import FeatureCollection, Feature
-from shapely.geometry import LineString
-from pyproj import Proj, transform
+from pyproj import Transformer, Proj
 
+
+class TripsGenerator:
+
+    """
+    A class that takes a geojson feature collection and returns an array of 
+    Deck.gl Waypoints for the Trips geo-layer
+    """
+
+    def __init__(self, geojson_input):
+        """
+        Parameters
+        ----------
+        geojson_input: geojson feature or feature collection
+        """
+        self.geojson_input = self._to_json(geojson_input)
+
+
+    def generate(self):
+        """
+        Convert all incoming geojson features into Shapely LineStrings
+        to feed into the Trip class that returns a Deck GL Trips Waypoint
+        object 
+        """
+        features = self.geojson_input['features']
+        coords_list = map(lambda x: geojson.utils.coords(x), features)
+        linestrings = [LineString(coords) for coords in coords_list]
+
+        output_data = [Trip(linestring).run() for linestring in linestrings]
+        
+        maximum_timestamp = max([stop['timestamp'] for linestring in output_data for stop in linestring['waypoints']])
+        
+        return { 'DATA': output_data, 'MAXIMUM': maximum_timestamp }
+
+
+
+    def _to_json(self, geojson_input):
+        with open(geojson_input) as this_json:
+            return json.load(this_json)
+
+        
 
 class Waypoints(dict):
     """
     A class representing a Deck.gl Trips array
     """
 
-    def __init__(self, coordinates=None):
+    def __init__(self, stops):
         """
-        :param coordinates: a list of [x, y, time] lists derived from
+        Parameters
+        ----------
+        stops: a list of [(x, y), time] lists derived from
         a geojson LineString's coordinates array
-        :type iterable: list
-        :return: an array of Waypoints
+
+        Returns an array of Waypoints for Deck GL Trips consumption
         """
         super().__init__(self)
-        self.coordinates = coordinates
-        if coordinates:
-            self["waypoints"] = self.__set_coords()
+        self.stops = stops
+        if self.stops:
+            self["waypoints"] = self._set_coords()
 
-    def __set_coords(self):
-        return [{"coordinates": [pair[0], pair[1]], "timestamp": pair[2]} for pair in self.coordinates]
+    
+    def _set_coords(self):
+        return [{"coordinates": stop[0], "timestamp": stop[1]} for stop in self.stops]
 
 
 class Trip:
+
     """
-    A class that converts a unique formatted LineString FeatureCollection
-    into Kepler.gl geojson or Deck.gl array for Trips animation
+    Converts a LineString's array into projected coordinates and
+    calculates the time taken to travel between each LineString's
+    node
     """
 
-    def __init__(self, json_input, geographic_crs, projected_crs):
+    TIME = 0
+
+    def __init__(self, linestring):
         """
-        Initialises a json input and sets Trip geographic and projected crs
-        :param json_input: formatted LineString FeatureCollection
-        :type json_input: json/geojson string
-        :param geographic_crs: geographic crs - will likely hard code to wgs84 in future
-        :type geographic_crs: str
-        :param projected_crs: local projected crs (calculates lengths in meters)
-        :type projected_crs: str
+        Parameters
+        ----------
+        linestring: A Shapely Linestring object 
         """
-        self.json_input = self.__to_json(json_input)
-        self.start_time = 1583884800
-        self.m_per_second = 10
-        self.geographic_crs = geographic_crs
-        self.projected_crs = projected_crs
+        self.linestring = linestring
+
+
+    def run(self):
+        """
+        Performs the calculations for each linestring and 
+        returns a Waypoint Object
+        """
+        _to_crs = 'epsg:28355'
+
+        projected_linestring = self._reproject_linestring(_to_crs, self.linestring)
+        projected_coords = list(projected_linestring.coords)
+
+        geo_coords = list(self.linestring.coords)
+        stop_times = self._get_stop_times(projected_coords)
+
+        stops_zipped = zip(geo_coords, stop_times)
+        return Waypoints(stops_zipped)
 
     
-    def __to_json(self, json_input):
-        with open(json_input) as this_json:
-            return json.load(this_json)
+    def _reproject_linestring(self, to_crs, linestring):
+        """ Reprojects from wgs84 to planar crs """
+        project = Transformer.from_proj(Proj('epsg:4326'), Proj(to_crs), always_xy=True)
+        return transform(project.transform, linestring)
 
+    
+    def _get_stop_times(self, projected_coords):
+        """ Calculates the time between each point based on a m_per_second attribute"""
+        time = Trip.TIME
+        m_per_second = 40
+        time_list = []
 
-    def __get_distance(self, coords_1, coords_2):
-        """
-        calculates length in meters between two coordinate pairs
-
-        :param coords_1: lon,lat pair of point 1
-        :param coords_2: lon, lat pair of point 2
-        :type coords_1 coords_2: list, tuple
-        """
-        x1 = coords_2[0]
-        y1 = coords_2[1]
-        x2 = coords_1[0]
-        y2 = coords_1[1]
-        projected_y1, projected_x1 = transform(self.geographic_crs, self.projected_crs, y1, x1)
-        projected_y2, projected_x2 = transform(self.geographic_crs, self.projected_crs, y2, x2)
-        length = LineString([(projected_x1, projected_y1), (projected_x2, projected_y2)]).length
-        return length
-
-    def __json_iterator(self, output_type):
-        """
-        Iterates over all linestring coordinates and adds a 'visit time' to
-        each pair. The 'visit time' explains the timestamp that the point is 
-        visited
-        """
-
-        feature_list = []
-
-        for x, item in enumerate(self.json_input['features']):
-            if x == 0:
-                time = self.start_time
+        for idx, stop in enumerate(projected_coords):
+            j = idx - 1
+            if idx == 0:
+                time_list.append(Trip.TIME)
             else:
-                distance_from_start = item['properties']['distance']
-                time = int(self.start_time + distance_from_start / self.m_per_second)
-            
-            this_coords = [_ for sublist in item['geometry']['coordinates'] for _ in sublist]
-
-            for i, pair in enumerate(this_coords):
-                j = i - 1
-                if i == 0:
-                    pair.append(time)
-                else:
-                    line_length = self.__get_distance(this_coords[j], pair)
-                    time += int(line_length / self.m_per_second)
-                    pair.append(time)
-            
-            if output_type == "json":
-                this_linestring = geojson.LineString(this_coords)
-                this_feature = Feature(geometry=this_linestring, type="Feature")
-                feature_list.append(this_feature)
-            
-            elif output_type == "waypoints":
-                feature_list.append(Waypoints(this_coords))
-        return feature_list
+                path_length = Point(projected_coords[j]).distance(Point(stop))
+                Trip.TIME += int(path_length / m_per_second)
+                time_list.append(Trip.TIME)
+        stop_times = tuple(time_list)
+        return stop_times
 
 
-    def generate_trips(self, output_type, start_time = None, m_per_second = None):
-        """
-        Generates a Trips object in the format requested as per the output_type
-
-        :param output_type: type of output that is required - accepts 'json' or 'waypoints'
-        :type output_type: str
-        """
-
-        if start_time:
-            self.start_time = start_time
-        if m_per_second:
-            self.m_per_second = m_per_second
-
-        if output_type == 'json'.lower():
-            features = self.__json_iterator("json")
-            output = FeatureCollection(features)
-        
-        elif output_type == 'waypoints'.lower():
-            output = self.__json_iterator("waypoints")
-
-        return output
+    
